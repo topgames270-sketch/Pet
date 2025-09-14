@@ -32,3 +32,127 @@ google-services.json
 
 # Android Profiling
 *.hprof
+
+Autenticação: POST /auth/login → retorna access_token, refresh_token
+Users: GET /users, POST /users, PUT /users/:id
+Clients/Animals: CRUD GET /clients, POST /clients, GET /clients/:id/animals, POST /clients/:id/animals
+Services / Templates: CRUD
+Appointments:
+	•	POST /appointments (agendar)
+	•	GET /appointments?date=YYYY-MM-DD&status=...
+	•	PUT /appointments/:id (mudar status)
+Checklist:
+	•	GET /templates/:id/items
+	•	POST /appointments/:id/checklist_responses (envia respostas)
+	•	GET /appointments/:id/checklist_responses
+Attachments:
+	•	POST /appointments/:id/attachments (upload)
+Payments:
+	•	POST /appointments/:id/payments
+Reports:
+	•	GET /reports/service_summary?from=YYYY-MM-DD&to=YYYY-MM-DD
+// routes/checklist.js
+const express = require('express');
+const router = express.Router();
+const db = require('../db'); // wrapper para queries
+
+// salvar respostas
+router.post('/appointments/:appointmentId/checklist_responses', async (req, res) => {
+  const userId = req.user.id; // middleware auth
+  const { template_id, answers } = req.body;
+  const appointmentId = parseInt(req.params.appointmentId, 10);
+
+  try {
+    await db.query('BEGIN');
+    const resp = await db.query(
+      `INSERT INTO checklist_responses(appointment_id, template_id, created_by)
+       VALUES($1,$2,$3) RETURNING id`, [appointmentId, template_id, userId]
+    );
+    const responseId = resp.rows[0].id;
+
+    const insertPromises = answers.map(a => {
+      return db.query(
+        `INSERT INTO checklist_answers(response_id, item_id, value, note)
+         VALUES($1,$2,$3,$4)`,
+        [responseId, a.item_id, JSON.stringify(a.value), a.note || null]
+      );
+    });
+    await Promise.all(insertPromises);
+
+    // audit log
+    await db.query(
+      `INSERT INTO audit_logs(user_id, action, entity, entity_id, data)
+       VALUES($1,'create_checklist','checklist_responses',$2,$3)`,
+      [userId, responseId, JSON.stringify({ appointmentId, template_id })]
+    );
+
+    await db.query('COMMIT');
+    res.status(201).json({ id: responseId });
+  } catch (err) {
+    await db.query('ROLLBACK');
+    console.error(err);
+    res.status(500).json({ error: 'Erro ao salvar checklist' });
+  }
+});
+
+module.exports = router;
+function Checklist({ template, onSubmit }) {
+  const [answers, setAnswers] = useState({});
+
+  const handleChange = (itemId, value) => {
+    setAnswers(prev => ({ ...prev, [itemId]: value }));
+  };
+
+  return (
+    <form onSubmit={(e) => {
+      e.preventDefault();
+      const answerArray = Object.entries(answers).map(([itemId, value]) => ({
+        item_id: Number(itemId), value
+      }));
+      onSubmit(answerArray);
+    }}>
+      {template.items.map(item => (
+        <div key={item.id}>
+          <label>{item.label}{item.required ? '*' : ''}</label>
+          {item.type === 'boolean' && (
+            <input type="checkbox" onChange={e => handleChange(item.id, e.target.checked)} />
+          )}
+          {item.type === 'text' && (
+            <input type="text" onChange={e => handleChange(item.id, e.target.value)} />
+          )}
+          {item.type === 'photo' && (
+            <input type="file" accept="image/*" onChange={e => uploadPhotoAndSetValue(e, item.id)} />
+          )}
+        </div>
+      ))}
+      <button type="submit">Salvar checklist</button>
+    </form>
+  );
+}
+
+version: "3.8"
+services:
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: petshop
+      POSTGRES_USER: petuser
+      POSTGRES_PASSWORD: petpass
+    volumes:
+      - db_data:/var/lib/postgresql/data
+
+  backend:
+    build: ./backend
+    depends_on: [db]
+    environment:
+      DATABASE_URL: postgres://petuser:petpass@db:5432/petshop
+    ports:
+      - "4000:4000"
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:80"
+
+volumes:
+  db_data:
